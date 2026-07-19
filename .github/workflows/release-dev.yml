@@ -489,6 +489,38 @@ jobs:
                   test "$revision" = "$SOURCE_SHA"
                   test "$source_repository" = 'https://github.com/netanel24A/reviewbot-render-dev-bootstrap'
 
+                  environment_response="$(curl --fail --silent --show-error \
+                    --header "$auth_header" \
+                    --header 'Accept: application/json' \
+                    "$api_base/services/$RENDER_SERVICE_ID/env-vars?limit=100")"
+                  environment_count="$(jq 'length' <<<"$environment_response")"
+                  if [[ ! "$environment_count" =~ ^[0-9]+$ || "$environment_count" -eq 0 || "$environment_count" -ge 100 ]]; then
+                    echo '::error::Render DEV environment variables were empty or may have been truncated.'
+                    exit 1
+                  fi
+                  source_sha_count="$(jq '[.[].envVar | select(.key == "SOURCE_SHA")] | length' <<<"$environment_response")"
+                  if [[ "$source_sha_count" != '1' ]]; then
+                    echo '::error::Render DEV must have exactly one SOURCE_SHA environment variable.'
+                    exit 1
+                  fi
+                  environment_payload="$(jq --compact-output --arg source_sha "$SOURCE_SHA" \
+                    '[.[].envVar | if .key == "SOURCE_SHA" then .value = $source_sha else . end]' \
+                    <<<"$environment_response")"
+                  unset environment_response
+                  environment_update_response="$(curl --fail --silent --show-error \
+                    --request PUT \
+                    --header "$auth_header" \
+                    --header 'Content-Type: application/json' \
+                    --data "$environment_payload" \
+                    "$api_base/services/$RENDER_SERVICE_ID/env-vars")"
+                  unset environment_payload
+                  updated_source_sha="$(jq --raw-output \
+                    '[.[] | (.envVar // .) | select(.key == "SOURCE_SHA") | .value] | if length == 1 then .[0] else empty end' \
+                    <<<"$environment_update_response")"
+                  unset environment_update_response
+                  test "$updated_source_sha" = "$SOURCE_SHA"
+                  echo 'Render DEV release metadata now matches the sealed source revision.'
+
                   service_payload="$(jq --null-input --compact-output \
                     --arg owner "$RENDER_OWNER_ID" \
                     --arg image "$image_url" \
