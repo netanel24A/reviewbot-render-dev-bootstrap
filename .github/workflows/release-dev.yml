@@ -1,0 +1,578 @@
+name: Verify and deploy sealed ReviewBot DEV
+
+on:
+    schedule:
+        - cron: '*/15 * * * *'
+    workflow_dispatch:
+    push:
+        branches: [main]
+        paths: [SOURCE_SHA]
+
+permissions:
+    contents: write
+    packages: write
+
+concurrency:
+    group: reviewbot-render-dev-release
+    cancel-in-progress: false
+
+env:
+    CI: 'true'
+    NODE_OPTIONS: --max-old-space-size=6144
+    NEXT_TELEMETRY_DISABLED: '1'
+    TZ: Asia/Jerusalem
+    IMAGE_PATH: ghcr.io/netanel24a/reviewbot-backend-dev-sealed
+    RENDER_OWNER_ID: tea-d6iqhjh4tr6s73cjhe1g
+    RENDER_SERVICE_ID: srv-d95ma0po3t8c73ca21vg
+    RENDER_SERVICE_URL: https://reviewbot-backend-dev.onrender.com
+
+jobs:
+    release:
+        name: Private QA gates · sealed image · Render DEV
+        runs-on: ubuntu-latest
+        timeout-minutes: 75
+        services:
+            postgres:
+                image: postgres:16-alpine
+                env:
+                    POSTGRES_USER: reviewbot_ci
+                    POSTGRES_PASSWORD: reviewbot_ci
+                    POSTGRES_DB: reviewbot_ci
+                ports:
+                    - 5432:5432
+                options: >-
+                    --health-cmd "pg_isready -U reviewbot_ci -d reviewbot_ci"
+                    --health-interval 5s
+                    --health-timeout 5s
+                    --health-retries 10
+            redis:
+                image: redis:7-alpine
+                ports:
+                    - 6379:6379
+                options: >-
+                    --health-cmd "redis-cli ping"
+                    --health-interval 5s
+                    --health-timeout 5s
+                    --health-retries 10
+        env:
+            NODE_ENV: test
+            DATABASE_URL: postgresql://reviewbot_ci:reviewbot_ci@127.0.0.1:5432/reviewbot_ci?sslmode=disable
+            E2E_DATABASE_URL: postgresql://reviewbot_ci:reviewbot_ci@127.0.0.1:5432/reviewbot_ci?sslmode=disable
+            REDIS_URL: redis://127.0.0.1:6379
+            BULL_PREFIX: reviewbot-public-release-${{ github.run_id }}-${{ github.run_attempt }}
+            ADMIN_SESSION_SECRET: ci-admin-session-secret-at-least-32-chars
+            PROVIDER_SESSION_SECRET: ci-provider-session-secret-at-least-32-chars
+            PHONE_OTP_SECRET: ci-phone-otp-secret-at-least-32-characters
+            CALENDAR_ENCRYPTION_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
+            DEV_NO_REDIS: 'false'
+        steps:
+            - name: Check out the trusted public release controller
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+
+            - name: Test encrypted rotating-credential envelope
+              run: node --test scripts/sealed-value.test.mjs
+
+            - name: Resolve and fetch the current private dev revision
+              id: source
+              env:
+                  REVIEWBOT_DEPLOY_KEY: ${{ secrets.REVIEWBOT_DEPLOY_KEY }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  if [[ -z "${REVIEWBOT_DEPLOY_KEY:-}" ]]; then
+                    echo '::error::The repository-scoped REVIEWBOT_DEPLOY_KEY secret is missing.'
+                    exit 1
+                  fi
+
+                  source_dir="$RUNNER_TEMP/reviewbot-source"
+                  key_file="$RUNNER_TEMP/reviewbot-readonly-key"
+                  known_hosts="$RUNNER_TEMP/reviewbot-known-hosts"
+                  printf '%s\n' "$REVIEWBOT_DEPLOY_KEY" > "$key_file"
+                  chmod 0600 "$key_file"
+                  printf '%s\n' \
+                    'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+                    > "$known_hosts"
+                  chmod 0600 "$known_hosts"
+                  trap 'rm -f -- "$key_file" "$known_hosts"' EXIT
+
+                  ssh_command="ssh -F /dev/null -i $key_file -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+                  remote_sha="$(GIT_SSH_COMMAND="$ssh_command" git ls-remote \
+                    git@github.com:netanel24A/ReviewBot.git refs/heads/dev | awk '{print $1}')"
+                  if [[ ! "$remote_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                    echo '::error::Could not resolve a valid private dev revision.'
+                    exit 1
+                  fi
+
+                  deployed_sha=''
+                  if [[ -f DEPLOYED_SOURCE_SHA ]]; then
+                    deployed_sha="$(tr -d '\r\n' < DEPLOYED_SOURCE_SHA)"
+                  fi
+                  changed='false'
+                  if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' || "$remote_sha" != "$deployed_sha" ]]; then
+                    changed='true'
+                  fi
+
+                  echo "sha=$remote_sha" >> "$GITHUB_OUTPUT"
+                  echo "directory=$source_dir" >> "$GITHUB_OUTPUT"
+                  echo "changed=$changed" >> "$GITHUB_OUTPUT"
+                  if [[ "$changed" != 'true' ]]; then
+                    echo 'The deployed marker already matches the private dev branch.'
+                    exit 0
+                  fi
+
+                  git init --quiet "$source_dir"
+                  git -C "$source_dir" remote add origin git@github.com:netanel24A/ReviewBot.git
+                  GIT_SSH_COMMAND="$ssh_command" git -C "$source_dir" fetch \
+                    --quiet --depth=2 --filter=blob:none origin "$remote_sha"
+                  git -C "$source_dir" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
+                  test "$(git -C "$source_dir" rev-parse HEAD)" = "$remote_sha"
+                  test -f "$source_dir/backend/Dockerfile.sealed"
+                  test -f "$source_dir/package-lock.json"
+
+            - name: Set up the pinned Node runtime
+              if: steps.source.outputs.changed == 'true'
+              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: 22
+
+            - name: Install the exact private dependency graph
+              if: steps.source.outputs.changed == 'true'
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  cd "${{ steps.source.outputs.directory }}"
+                  if npm ci > "$RUNNER_TEMP/npm-ci.log" 2>&1; then
+                    echo 'Exact workspace dependency installation passed.'
+                  else
+                    echo '::error::Exact workspace dependency installation failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+
+            - name: Production preflight, audit, format, lint, types, unit tests, and builds
+              if: steps.source.outputs.changed == 'true'
+              env:
+                  REVIEWBOT_VALIDATE_DEPLOY_ENV: 'true'
+                  BACKEND_API_URL: https://api.ci.reviewbot.invalid
+                  NEXT_PUBLIC_API_URL: https://api.ci.reviewbot.invalid
+                  NEXT_PUBLIC_BASE_URL: https://app.ci.reviewbot.invalid
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  cd "${{ steps.source.outputs.directory }}"
+
+                  run_gate() {
+                    local slug="$1"
+                    local label="$2"
+                    shift 2
+                    if "$@" > "$RUNNER_TEMP/$slug.log" 2>&1; then
+                      echo "$label passed."
+                    else
+                      echo "::error::$label failed; output is withheld from the public log."
+                      exit 1
+                    fi
+                  }
+
+                  if git rev-parse HEAD^ >/dev/null 2>&1; then
+                    export FORMAT_BASE_SHA="$(git rev-parse HEAD^)"
+                  fi
+                  run_gate preflight 'Production secret preflight' npm run preflight:prod
+                  run_gate audit 'Dependency audit at moderate severity' npm audit --audit-level=moderate
+                  run_gate format 'Changed-file formatting ratchet' npm run format:check
+                  run_gate lint 'Workspace lint' npm run lint:check
+                  run_gate types 'Workspace typecheck' npm run typecheck
+                  run_gate frontend-unit 'Frontend unit tests' npm run test --workspace=@reviewbot/frontend
+                  run_gate backend-unit 'Backend unit and integration tests' npm run test --workspace=@reviewbot/backend
+                  run_gate payload-crypto 'Sealed payload cryptography tests' npm run test:sealed-payload --workspace=@reviewbot/backend
+                  run_gate backend-build 'Backend production build' npm run build --workspace=@reviewbot/backend
+                  run_gate frontend-build 'Frontend production build' npm run build --workspace=@reviewbot/frontend
+
+            - name: Fresh PostgreSQL migrations, drift, idempotency, Redis, and merged backend E2E
+              if: steps.source.outputs.changed == 'true'
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  source_dir="${{ steps.source.outputs.directory }}"
+                  cd "$source_dir"
+
+                  if (cd backend && npm run db:generate) > "$RUNNER_TEMP/db-generate.log" 2>&1; then
+                    echo 'Migration generation completed.'
+                  else
+                    echo '::error::Migration generation failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+                  if [[ -n "$(git status --porcelain --untracked-files=all -- backend/src/database/migrations)" ]]; then
+                    echo '::error::Schema drift detected: generated migrations do not match the committed private revision.'
+                    exit 1
+                  fi
+                  if npm run db:migrate > "$RUNNER_TEMP/db-migrate-first.log" 2>&1 && \
+                     npm run db:migrate > "$RUNNER_TEMP/db-migrate-second.log" 2>&1; then
+                    echo 'Fresh migrations and idempotent re-application passed.'
+                  else
+                    echo '::error::Fresh migration or idempotency gate failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+                  if npm run test:cov --workspace=@reviewbot/backend > "$RUNNER_TEMP/backend-coverage.log" 2>&1; then
+                    echo 'Merged backend release coverage passed against PostgreSQL and Redis.'
+                  else
+                    echo '::error::Merged backend release coverage failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+
+            - name: Chromium production-build smoke
+              if: steps.source.outputs.changed == 'true'
+              env:
+                  BACKEND_API_URL: http://127.0.0.1:4000
+                  NEXT_PUBLIC_API_URL: http://127.0.0.1:4000
+                  NEXT_PUBLIC_BASE_URL: http://127.0.0.1:3000
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  cd "${{ steps.source.outputs.directory }}"
+                  if (cd frontend && npx playwright install --with-deps chromium) > "$RUNNER_TEMP/playwright-install.log" 2>&1 && \
+                     npm run test:e2e:smoke --workspace=@reviewbot/frontend > "$RUNNER_TEMP/playwright-smoke.log" 2>&1; then
+                    echo 'Chromium production-build smoke passed.'
+                  else
+                    echo '::error::Chromium production-build smoke failed; diagnostics are withheld from the public repository.'
+                    exit 1
+                  fi
+
+            - name: Build both ordinary production containers
+              if: steps.source.outputs.changed == 'true'
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  cd "${{ steps.source.outputs.directory }}"
+                  if docker build --file backend/Dockerfile --tag reviewbot-backend:release-gate . \
+                       > "$RUNNER_TEMP/backend-container.log" 2>&1 && \
+                     docker build \
+                       --file frontend/Dockerfile \
+                       --build-arg BACKEND_API_URL=https://api.ci.reviewbot.invalid \
+                       --build-arg NEXT_PUBLIC_API_URL=https://api.ci.reviewbot.invalid \
+                       --build-arg NEXT_PUBLIC_BASE_URL=https://app.ci.reviewbot.invalid \
+                       --tag reviewbot-frontend:release-gate \
+                       . > "$RUNNER_TEMP/frontend-container.log" 2>&1; then
+                    echo 'Backend and frontend production container builds passed.'
+                  else
+                    echo '::error::A production container build failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+                  docker image rm reviewbot-backend:release-gate reviewbot-frontend:release-gate >/dev/null
+                  docker builder prune --all --force >/dev/null
+
+            - name: Build, attack-test, and publish the ciphertext-only runtime
+              if: steps.source.outputs.changed == 'true'
+              env:
+                  PAYLOAD_KEY: ${{ secrets.REVIEWBOT_PAYLOAD_KEY }}
+                  GHCR_TOKEN: ${{ github.token }}
+                  SOURCE_SHA: ${{ steps.source.outputs.sha }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  if [[ ! "${PAYLOAD_KEY:-}" =~ ^[0-9a-f]{64}$ ]]; then
+                    echo '::error::The REVIEWBOT_PAYLOAD_KEY secret is missing or malformed.'
+                    exit 1
+                  fi
+
+                  source_dir="${{ steps.source.outputs.directory }}"
+                  key_file="$RUNNER_TEMP/reviewbot-payload-key"
+                  image="$IMAGE_PATH:$SOURCE_SHA"
+                  printf '%s\n' "$PAYLOAD_KEY" > "$key_file"
+                  chmod 0444 "$key_file"
+                  trap 'rm -f -- "$key_file"; docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+
+                  if docker buildx build \
+                    --load \
+                    --file "$source_dir/backend/Dockerfile.sealed" \
+                    --secret "id=reviewbot_payload_key,src=$key_file" \
+                    --build-arg "SOURCE_SHA=$SOURCE_SHA" \
+                    --tag "$image" \
+                    "$source_dir" > "$RUNNER_TEMP/sealed-container.log" 2>&1; then
+                    echo 'Ciphertext-only backend image build passed.'
+                  else
+                    echo '::error::Ciphertext-only backend image build failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+
+                  set +e
+                  missing_output="$(docker run --rm "$image" node -e 'process.exit(0)' 2>&1)"
+                  missing_status=$?
+                  set -e
+                  test "$missing_status" -eq 78
+                  test "$missing_output" = 'ReviewBot sealed payload key is unavailable; refusing to start.'
+
+                  if docker history --no-trunc "$image" | grep -Fq "$PAYLOAD_KEY"; then
+                    echo '::error::The payload key leaked into image history.'
+                    exit 1
+                  fi
+
+                  docker run --rm --entrypoint node "$image" -e "
+                    const fs = require('node:fs');
+                    if (!fs.existsSync('/opt/reviewbot/payload.sealed')) process.exit(1);
+                    for (const path of ['/payload', '/src', '/app/backend/dist', '/tmp/reviewbot-runtime/app/backend']) {
+                      if (fs.existsSync(path)) process.exit(2);
+                    }
+                  "
+
+                  docker run --rm \
+                    --mount "type=bind,src=$key_file,dst=/etc/secrets/reviewbot_payload_key,readonly" \
+                    "$image" \
+                    node -e "
+                      const fs = require('node:fs');
+                      for (const path of [
+                        'backend/dist/main.js',
+                        'backend/dist/database/migrate.js',
+                        'backend/dist/database/migrations/meta/_journal.json',
+                        'node_modules',
+                      ]) if (!fs.existsSync(path)) process.exit(3);
+                      if (fs.existsSync('backend/src')) process.exit(4);
+                    "
+
+                  test "$(docker inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
+                  test "$(docker inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
+                    'https://github.com/netanel24A/reviewbot-render-dev-bootstrap'
+
+                  printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
+                    --username "$GITHUB_REPOSITORY_OWNER" --password-stdin >/dev/null
+                  if docker push "$image" > "$RUNNER_TEMP/sealed-push.log" 2>&1; then
+                    echo 'Immutable sealed image published.'
+                  else
+                    echo '::error::Publishing the sealed image failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+                  docker logout ghcr.io >/dev/null 2>&1 || true
+                  docker image rm "$image" >/dev/null
+
+                  for attempt in $(seq 1 30); do
+                    if docker manifest inspect "$image" >/dev/null 2>&1; then
+                      echo "Anonymous GHCR pull access passed on attempt $attempt."
+                      exit 0
+                    fi
+                    sleep 5
+                  done
+                  echo '::error::The sealed image is not anonymously pullable.'
+                  exit 1
+
+            - name: Rotate the encrypted Render credential
+              if: steps.source.outputs.changed == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RENDER_REFRESH_WRAPPING_KEY: ${{ secrets.RENDER_REFRESH_WRAPPING_KEY }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  if [[ ! "${RENDER_REFRESH_WRAPPING_KEY:-}" =~ ^[0-9a-f]{64}$ ]]; then
+                    echo '::error::The RENDER_REFRESH_WRAPPING_KEY secret is missing or malformed.'
+                    exit 1
+                  fi
+                  test -f RENDER_REFRESH_TOKEN.sealed
+
+                  askpass="$RUNNER_TEMP/reviewbot-git-askpass"
+                  key_file="$RUNNER_TEMP/render-refresh-wrapping-key"
+                  current_file="$RUNNER_TEMP/render-refresh-token"
+                  next_file="$RUNNER_TEMP/render-next-refresh-token"
+                  next_sealed="$RUNNER_TEMP/render-next-refresh-token.sealed"
+                  printf '%s\n' '#!/bin/sh' \
+                    'case "$1" in' \
+                    '  *Username*) printf "%s\\n" x-access-token ;;' \
+                    '  *Password*) printf "%s\\n" "$GH_TOKEN" ;;' \
+                    'esac' > "$askpass"
+                  chmod 0700 "$askpass"
+                  printf '%s\n' "$RENDER_REFRESH_WRAPPING_KEY" > "$key_file"
+                  chmod 0600 "$key_file"
+                  cleanup() {
+                    rm -f -- "$askpass" "$key_file" "$current_file" "$next_file" "$next_sealed"
+                  }
+                  trap cleanup EXIT
+
+                  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+                    git pull --ff-only https://github.com/"$GITHUB_REPOSITORY".git main >/dev/null
+                  node scripts/sealed-value.mjs decrypt \
+                    RENDER_REFRESH_TOKEN.sealed "$current_file" "$key_file"
+                  refresh_token="$(< "$current_file")"
+                  rm -f -- "$current_file"
+                  if [[ -z "$refresh_token" || "${#refresh_token}" -gt 4096 ]]; then
+                    echo '::error::The decrypted Render refresh credential is malformed.'
+                    exit 1
+                  fi
+
+                  refresh_body="$(jq --null-input --compact-output \
+                    --arg refresh_token "$refresh_token" \
+                    '{grant_type:"refresh_token",refresh_token:$refresh_token}')"
+                  unset refresh_token
+                  refresh_response="$(curl --fail --silent --show-error \
+                    --request POST \
+                    --header 'Content-Type: application/x-www-form-urlencoded' \
+                    --data "$refresh_body" \
+                    https://api.render.com/v1/token/refresh/)"
+                  unset refresh_body
+                  access_token="$(jq --raw-output '.access_token // empty' <<<"$refresh_response")"
+                  next_refresh_token="$(jq --raw-output '.refresh_token // empty' <<<"$refresh_response")"
+                  expires_in="$(jq --raw-output '.expires_in // 0' <<<"$refresh_response")"
+                  unset refresh_response
+                  if [[ -z "$access_token" || -z "$next_refresh_token" || ! "$expires_in" =~ ^[0-9]+$ || "$expires_in" -lt 60 ]]; then
+                    echo '::error::Render returned an invalid rotated credential response.'
+                    exit 1
+                  fi
+                  echo "::add-mask::$access_token"
+                  echo "::add-mask::$next_refresh_token"
+                  printf 'RENDER_ACCESS_TOKEN=%s\n' "$access_token" >> "$GITHUB_ENV"
+                  unset access_token
+
+                  printf '%s' "$next_refresh_token" > "$next_file"
+                  unset next_refresh_token
+                  chmod 0600 "$next_file"
+                  node scripts/sealed-value.mjs encrypt "$next_file" "$next_sealed" "$key_file"
+                  rm -f -- "$next_file"
+                  install -m 0600 "$next_sealed" RENDER_REFRESH_TOKEN.sealed
+
+                  git config user.name 'reviewbot-dev-release-bot'
+                  git config user.email 'reviewbot-dev-release-bot@users.noreply.github.com'
+                  git add RENDER_REFRESH_TOKEN.sealed
+                  if git diff --cached --quiet; then
+                    echo '::error::The rotated encrypted Render credential did not change.'
+                    exit 1
+                  fi
+                  git commit --quiet -m 'security: rotate encrypted Render DEV credential'
+                  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+                    git push https://github.com/"$GITHUB_REPOSITORY".git HEAD:main >/dev/null
+                  echo 'Rotated Render credential was durably persisted as authenticated ciphertext.'
+
+            - name: Deploy only the allowlisted Render DEV service
+              if: steps.source.outputs.changed == 'true'
+              env:
+                  SOURCE_SHA: ${{ steps.source.outputs.sha }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  if [[ -z "${RENDER_ACCESS_TOKEN:-}" ]]; then
+                    echo '::error::The short-lived Render access token is unavailable.'
+                    exit 1
+                  fi
+
+                  readonly api_base='https://api.render.com/v1'
+                  readonly image_url="$IMAGE_PATH:$SOURCE_SHA"
+                  readonly auth_header="Authorization: Bearer $RENDER_ACCESS_TOKEN"
+
+                  secret_file_names="$(curl --fail --silent --show-error \
+                    --header "$auth_header" \
+                    --header 'Accept: application/json' \
+                    "$api_base/services/$RENDER_SERVICE_ID/secret-files?limit=100" \
+                    | jq --raw-output '[.[].secretFile.name] | join("\n")')"
+                  if ! grep -Fxq 'reviewbot_payload_key' <<<"$secret_file_names"; then
+                    echo '::error::Render DEV is missing the sealed payload key.'
+                    exit 1
+                  fi
+
+                  docker logout ghcr.io >/dev/null 2>&1 || true
+                  docker pull "$image_url" > "$RUNNER_TEMP/render-image-pull.log" 2>&1
+                  revision="$(docker inspect "$image_url" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+                  source_repository="$(docker inspect "$image_url" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')"
+                  test "$revision" = "$SOURCE_SHA"
+                  test "$source_repository" = 'https://github.com/netanel24A/reviewbot-render-dev-bootstrap'
+
+                  service_payload="$(jq --null-input --compact-output \
+                    --arg owner "$RENDER_OWNER_ID" \
+                    --arg image "$image_url" \
+                    '{
+                      autoDeploy:"no",
+                      image:{ownerId:$owner,imagePath:$image},
+                      serviceDetails:{
+                        healthCheckPath:"/health/ready",
+                        preDeployCommand:"node backend/dist/database/migrate.js",
+                        maxShutdownDelaySeconds:60
+                      }
+                    }')"
+                  service_response="$(curl --fail --silent --show-error \
+                    --request PATCH \
+                    --header "$auth_header" \
+                    --header 'Content-Type: application/json' \
+                    --data "$service_payload" \
+                    "$api_base/services/$RENDER_SERVICE_ID")"
+                  test "$(jq --raw-output '.serviceDetails.runtime' <<<"$service_response")" = 'image'
+                  test "$(jq --raw-output '.registryCredential.id // empty' <<<"$service_response")" = ''
+                  test "$(jq --raw-output '.image.imagePath // empty' <<<"$service_response")" = "$image_url"
+
+                  deploy_payload="$(jq --null-input --compact-output --arg image "$image_url" '{imageUrl:$image}')"
+                  deploy_id="$(curl --fail --silent --show-error \
+                    --request POST \
+                    --header "$auth_header" \
+                    --header 'Content-Type: application/json' \
+                    --data "$deploy_payload" \
+                    "$api_base/services/$RENDER_SERVICE_ID/deploys" | jq --raw-output '.id')"
+                  if [[ ! "$deploy_id" =~ ^dep- ]]; then
+                    echo '::error::Render did not return a valid DEV deploy ID.'
+                    exit 1
+                  fi
+                  echo "Render DEV deploy started: $deploy_id"
+
+                  for attempt in $(seq 1 100); do
+                    deploy_status="$(curl --fail --silent --show-error \
+                      --header "$auth_header" \
+                      --header 'Accept: application/json' \
+                      "$api_base/services/$RENDER_SERVICE_ID/deploys/$deploy_id" | jq --raw-output '.status')"
+                    echo "Render DEV deploy status ($attempt/100): $deploy_status"
+                    case "$deploy_status" in
+                      live)
+                        break
+                        ;;
+                      build_failed|update_failed|pre_deploy_failed|canceled|deactivated)
+                        echo "::error::Render DEV deploy ended with status: $deploy_status"
+                        exit 1
+                        ;;
+                    esac
+                    if [[ "$attempt" == 100 ]]; then
+                      echo '::error::Timed out waiting for the Render DEV deploy.'
+                      exit 1
+                    fi
+                    sleep 12
+                  done
+
+                  for attempt in $(seq 1 30); do
+                    if curl --fail --silent --show-error --max-time 15 \
+                         "$RENDER_SERVICE_URL/health/live" >/dev/null && \
+                       curl --fail --silent --show-error --max-time 15 \
+                         "$RENDER_SERVICE_URL/health/ready" >/dev/null; then
+                      echo "Render DEV public liveness and readiness passed on attempt $attempt."
+                      exit 0
+                    fi
+                    sleep 10
+                  done
+                  echo '::error::Render DEV did not pass its public health gates.'
+                  exit 1
+
+            - name: Persist the successfully deployed private revision
+              if: steps.source.outputs.changed == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  SOURCE_SHA: ${{ steps.source.outputs.sha }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  askpass="$RUNNER_TEMP/reviewbot-marker-git-askpass"
+                  printf '%s\n' '#!/bin/sh' \
+                    'case "$1" in' \
+                    '  *Username*) printf "%s\\n" x-access-token ;;' \
+                    '  *Password*) printf "%s\\n" "$GH_TOKEN" ;;' \
+                    'esac' > "$askpass"
+                  chmod 0700 "$askpass"
+                  trap 'rm -f -- "$askpass"' EXIT
+
+                  printf '%s\n' "$SOURCE_SHA" > DEPLOYED_SOURCE_SHA
+                  git config user.name 'reviewbot-dev-release-bot'
+                  git config user.email 'reviewbot-dev-release-bot@users.noreply.github.com'
+                  git add DEPLOYED_SOURCE_SHA
+                  if git diff --cached --quiet; then
+                    echo 'The deployed source marker was already current.'
+                    exit 0
+                  fi
+                  git commit --quiet -m "deploy: record healthy ReviewBot DEV $SOURCE_SHA"
+                  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+                    git push https://github.com/"$GITHUB_REPOSITORY".git HEAD:main >/dev/null
+                  echo 'Healthy Render DEV source marker persisted.'
+
+            - name: Report an unchanged scheduled release
+              if: steps.source.outputs.changed != 'true'
+              run: echo 'No private dev revision change; release gates and deployment were intentionally skipped.'
