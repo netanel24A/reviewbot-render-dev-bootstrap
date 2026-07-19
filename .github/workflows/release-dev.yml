@@ -308,6 +308,9 @@ jobs:
                     exit 1
                   fi
 
+                  test "$(docker inspect "$image" --format '{{.Config.WorkingDir}}')" = \
+                    '/home/reviewbot'
+
                   docker run --rm --entrypoint node "$image" -e "
                     const fs = require('node:fs');
                     if (!fs.existsSync('/opt/reviewbot/payload.sealed')) process.exit(1);
