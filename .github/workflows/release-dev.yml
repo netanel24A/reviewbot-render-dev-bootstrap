@@ -493,7 +493,11 @@ jobs:
                     "$api_base/services/$RENDER_SERVICE_ID")"
                   test "$(jq --raw-output '.serviceDetails.runtime' <<<"$service_response")" = 'image'
                   test "$(jq --raw-output '.registryCredential.id // empty' <<<"$service_response")" = ''
-                  test "$(jq --raw-output '.image.imagePath // empty' <<<"$service_response")" = "$image_url"
+                  test "$(jq --raw-output '.imagePath // empty' <<<"$service_response")" = "$image_url"
+                  test "$(jq --raw-output '.serviceDetails.healthCheckPath' <<<"$service_response")" = '/health/ready'
+                  test "$(jq --raw-output '.serviceDetails.envSpecificDetails.preDeployCommand' <<<"$service_response")" = \
+                    'node backend/dist/database/migrate.js'
+                  test "$(jq --raw-output '.serviceDetails.maxShutdownDelaySeconds' <<<"$service_response")" = '60'
 
                   deploy_payload="$(jq --null-input --compact-output --arg image "$image_url" '{imageUrl:$image}')"
                   deploy_id="$(curl --fail --silent --show-error \
