@@ -126,7 +126,7 @@ jobs:
                   git init --quiet "$source_dir"
                   git -C "$source_dir" remote add origin git@github.com:netanel24A/ReviewBot.git
                   GIT_SSH_COMMAND="$ssh_command" git -C "$source_dir" fetch \
-                    --quiet --depth=2 --filter=blob:none origin "$remote_sha"
+                    --quiet --depth=2 origin "$remote_sha"
                   git -C "$source_dir" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
                   test "$(git -C "$source_dir" rev-parse HEAD)" = "$remote_sha"
                   test -f "$source_dir/backend/Dockerfile.sealed"
