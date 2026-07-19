@@ -1,13 +1,14 @@
-# ReviewBot Render DEV bootstrap
+# ReviewBot sealed Render DEV publisher
 
-This repository intentionally contains no ReviewBot application source or credentials.
+This public repository intentionally contains no ReviewBot application source, plaintext build artifacts, or credentials.
 
-It provides the reproducible Docker build entry point for the Render DEV service. At build time, Render mounts a repository-scoped, read-only GitHub deploy key as a BuildKit secret. The Dockerfile fetches the exact 40-character `SOURCE_SHA`, verifies it before building, and does not copy the key or Git metadata into the runtime image.
+After every gated `dev` build, the private ReviewBot workflow updates `SOURCE_SHA` through a repository-scoped deploy key. The workflow in this repository then fetches exactly that private revision with a separate read-only key, builds the backend, encrypts and authenticates its complete runtime payload with AES-256-GCM, attack-tests the result, and publishes only the sealed image.
 
 Operational guarantees:
 
-- The deploy key can read only `netanel24A/ReviewBot` and cannot write to it.
+- Both deploy keys are scoped to one repository; only the marker key can write, and only to this public bootstrap.
 - GitHub's published Ed25519 host key is pinned with strict host verification.
-- The requested source revision is checked before compilation.
-- Render stores the resulting image in its internal registry, so ordinary restarts do not depend on a short-lived external registry token.
-- Automatic deploys are disabled; ReviewBot's gated `dev` CI workflow supplies the verified source revision and triggers deployment.
+- The requested 40-character source revision is verified before compilation.
+- A missing key, wrong key, modified ciphertext, visible plaintext filesystem, or leaked key fails the workflow.
+- The public GHCR image contains Node, the small decryptor, and authenticated ciphertext only.
+- Render stores the decryption key as a secret file and can pull the public sealed image after an ordinary restart without any expiring registry credential.
