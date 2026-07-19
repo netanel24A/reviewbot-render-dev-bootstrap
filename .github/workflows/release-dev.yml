@@ -494,7 +494,7 @@ jobs:
                       image:{ownerId:$owner,imagePath:$image},
                       serviceDetails:{
                         healthCheckPath:"/health/ready",
-                        preDeployCommand:"node backend/dist/database/migrate.js",
+                        preDeployCommand:"/usr/local/bin/reviewbot-sealed-entrypoint node backend/dist/database/migrate.js",
                         maxShutdownDelaySeconds:60
                       }
                     }')"
@@ -509,7 +509,7 @@ jobs:
                   test "$(jq --raw-output '.imagePath // empty' <<<"$service_response")" = "$image_url"
                   test "$(jq --raw-output '.serviceDetails.healthCheckPath' <<<"$service_response")" = '/health/ready'
                   test "$(jq --raw-output '.serviceDetails.envSpecificDetails.preDeployCommand' <<<"$service_response")" = \
-                    'node backend/dist/database/migrate.js'
+                    '/usr/local/bin/reviewbot-sealed-entrypoint node backend/dist/database/migrate.js'
                   test "$(jq --raw-output '.serviceDetails.maxShutdownDelaySeconds' <<<"$service_response")" = '60'
 
                   deploy_payload="$(jq --null-input --compact-output --arg image "$image_url" '{imageUrl:$image}')"
