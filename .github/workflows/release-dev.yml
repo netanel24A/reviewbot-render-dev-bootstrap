@@ -347,7 +347,16 @@ jobs:
 
                   for attempt in $(seq 1 30); do
                     if docker manifest inspect "$image" >/dev/null 2>&1; then
-                      echo "Anonymous GHCR pull access passed on attempt $attempt."
+                      manifest_json="$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}')"
+                      image_digest="$(jq --raw-output '.digest // empty' <<<"$manifest_json")"
+                      if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                        echo '::error::GHCR did not return a valid immutable image digest.'
+                        exit 1
+                      fi
+                      immutable_image="$IMAGE_PATH@$image_digest"
+                      docker manifest inspect "$immutable_image" >/dev/null
+                      printf 'IMAGE_DIGEST=%s\n' "$image_digest" >> "$GITHUB_ENV"
+                      echo "Anonymous GHCR pull and immutable digest access passed on attempt $attempt."
                       exit 0
                     fi
                     sleep 5
@@ -451,9 +460,13 @@ jobs:
                     echo '::error::The short-lived Render access token is unavailable.'
                     exit 1
                   fi
+                  if [[ ! "${IMAGE_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                    echo '::error::The verified immutable image digest is unavailable.'
+                    exit 1
+                  fi
 
                   readonly api_base='https://api.render.com/v1'
-                  readonly image_url="$IMAGE_PATH:$SOURCE_SHA"
+                  readonly image_url="$IMAGE_PATH@$IMAGE_DIGEST"
                   readonly auth_header="Authorization: Bearer $RENDER_ACCESS_TOKEN"
 
                   secret_file_names="$(curl --fail --silent --show-error \
@@ -565,9 +578,10 @@ jobs:
                   trap 'rm -f -- "$askpass"' EXIT
 
                   printf '%s\n' "$SOURCE_SHA" > DEPLOYED_SOURCE_SHA
+                  printf '%s\n' "$IMAGE_DIGEST" > DEPLOYED_IMAGE_DIGEST
                   git config user.name 'reviewbot-dev-release-bot'
                   git config user.email 'reviewbot-dev-release-bot@users.noreply.github.com'
-                  git add DEPLOYED_SOURCE_SHA
+                  git add DEPLOYED_SOURCE_SHA DEPLOYED_IMAGE_DIGEST
                   if git diff --cached --quiet; then
                     echo 'The deployed source marker was already current.'
                     exit 0
