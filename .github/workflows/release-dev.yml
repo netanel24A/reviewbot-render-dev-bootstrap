@@ -503,8 +503,16 @@ jobs:
                     echo '::error::Render DEV must have exactly one SOURCE_SHA environment variable.'
                     exit 1
                   fi
+                  typing_enabled_count="$(
+                    jq '[.[].envVar | select(.key == "WHATSAPP_OUTBOUND_TYPING_ENABLED")] | length' \
+                      <<<"$environment_response"
+                  )"
+                  if [[ "$typing_enabled_count" != '1' ]]; then
+                    echo '::error::Render DEV must have exactly one WHATSAPP_OUTBOUND_TYPING_ENABLED environment variable.'
+                    exit 1
+                  fi
                   environment_payload="$(jq --compact-output --arg source_sha "$SOURCE_SHA" \
-                    '[.[].envVar | if .key == "SOURCE_SHA" then .value = $source_sha else . end]' \
+                    '[.[].envVar | if .key == "SOURCE_SHA" then .value = $source_sha elif .key == "WHATSAPP_OUTBOUND_TYPING_ENABLED" then .value = "false" else . end]' \
                     <<<"$environment_response")"
                   unset environment_response
                   environment_update_response="$(curl --fail --silent --show-error \
@@ -517,9 +525,13 @@ jobs:
                   updated_source_sha="$(jq --raw-output \
                     '[.[] | (.envVar // .) | select(.key == "SOURCE_SHA") | .value] | if length == 1 then .[0] else empty end' \
                     <<<"$environment_update_response")"
+                  updated_typing_enabled="$(jq --raw-output \
+                    '[.[] | (.envVar // .) | select(.key == "WHATSAPP_OUTBOUND_TYPING_ENABLED") | .value] | if length == 1 then .[0] else empty end' \
+                    <<<"$environment_update_response")"
                   unset environment_update_response
                   test "$updated_source_sha" = "$SOURCE_SHA"
-                  echo 'Render DEV release metadata now matches the sealed source revision.'
+                  test "$updated_typing_enabled" = 'false'
+                  echo 'Render DEV metadata matches the sealed source revision; artificial typing is disabled.'
 
                   service_payload="$(jq --null-input --compact-output \
                     --arg owner "$RENDER_OWNER_ID" \
