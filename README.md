@@ -15,4 +15,5 @@ Operational guarantees:
 - Render stores the decryption key as a secret file and can pull the public sealed image after an ordinary restart without any expiring registry credential.
 - The short-lived Render access token is derived from a rotating refresh credential. Only its AES-256-GCM ciphertext is committed; the independent wrapping key remains an Actions secret.
 - The anonymously pullable image is resolved to a registry SHA-256 digest, and Render is configured with that immutable digest instead of a mutable tag.
+- Every DEV deployment forces the linked-device socket runtime off, forces central proactive messaging off, and removes the retired artificial-typing variable while preserving every non-allowlisted environment entry byte-for-byte.
 - The rotated refresh ciphertext is committed before deployment, and the deployed source/digest markers are committed only after Render reports a live deployment and both public health gates pass.
