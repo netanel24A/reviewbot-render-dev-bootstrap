@@ -240,6 +240,22 @@ jobs:
                     echo '::error::The failed merged-backend gate produced no diagnostic log.'
                     exit 1
                   fi
+                  source_dir="${{ steps.source.outputs.directory }}"
+                  {
+                    printf '\n[encrypted diagnostic rerun: PostgreSQL/Redis HTTP E2E coverage]\n'
+                    set +e
+                    (
+                      cd "$source_dir/backend"
+                      node ./node_modules/vitest/vitest.mjs run \
+                        --config ./test/vitest-coverage-e2e.config.ts \
+                        --coverage \
+                        --coverage.reportsDirectory "$RUNNER_TEMP/diagnostic-e2e-coverage" \
+                        --reporter default
+                    )
+                    diagnostic_status=$?
+                    set -e
+                    printf '[encrypted diagnostic rerun exit status: %s]\n' "$diagnostic_status"
+                  } >> "$diagnostic_source" 2>&1
                   printf '%s\n' "$RELEASE_DIAGNOSTIC_KEY" > "$key_file"
                   chmod 0600 "$key_file"
                   trap 'rm -f -- "$key_file"' EXIT
