@@ -190,6 +190,7 @@ jobs:
                   run_gate frontend-build 'Frontend production build' npm run build --workspace=@reviewbot/frontend
 
             - name: Fresh PostgreSQL migrations, drift, idempotency, Redis, and merged backend E2E
+              id: merged_backend_release
               if: steps.source.outputs.changed == 'true'
               shell: bash
               run: |
@@ -220,6 +221,40 @@ jobs:
                     echo '::error::Merged backend release coverage failed; output is withheld from the public log.'
                     exit 1
                   fi
+
+            - name: Seal failed merged-backend diagnostics
+              if: failure() && steps.merged_backend_release.conclusion == 'failure'
+              env:
+                  RELEASE_DIAGNOSTIC_KEY: ${{ secrets.RELEASE_DIAGNOSTIC_KEY }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+                  if [[ ! "${RELEASE_DIAGNOSTIC_KEY:-}" =~ ^[0-9a-f]{64}$ ]]; then
+                    echo '::error::The one-time RELEASE_DIAGNOSTIC_KEY secret is missing or malformed.'
+                    exit 1
+                  fi
+                  diagnostic_source="$RUNNER_TEMP/backend-coverage.log"
+                  diagnostic_envelope="$RUNNER_TEMP/backend-coverage.log.sealed"
+                  key_file="$RUNNER_TEMP/release-diagnostic-key"
+                  if [[ ! -s "$diagnostic_source" ]]; then
+                    echo '::error::The failed merged-backend gate produced no diagnostic log.'
+                    exit 1
+                  fi
+                  printf '%s\n' "$RELEASE_DIAGNOSTIC_KEY" > "$key_file"
+                  chmod 0600 "$key_file"
+                  trap 'rm -f -- "$key_file"' EXIT
+                  node scripts/sealed-value.mjs encrypt \
+                    "$diagnostic_source" "$diagnostic_envelope" "$key_file"
+                  echo 'Failed merged-backend diagnostics were authenticated and encrypted.'
+
+            - name: Upload encrypted merged-backend diagnostics
+              if: failure() && steps.merged_backend_release.conclusion == 'failure'
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: merged-backend-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: ${{ runner.temp }}/backend-coverage.log.sealed
+                  if-no-files-found: error
+                  retention-days: 1
 
             - name: Chromium production-build smoke
               if: steps.source.outputs.changed == 'true'
