@@ -60,9 +60,12 @@ jobs:
             E2E_DATABASE_URL: postgresql://reviewbot_ci:reviewbot_ci@127.0.0.1:5432/reviewbot_ci?sslmode=disable
             REDIS_URL: redis://127.0.0.1:6379
             BULL_PREFIX: reviewbot-public-release-${{ github.run_id }}-${{ github.run_attempt }}
+            REQUIRE_WHATSAPP_REAL_E2E: 'true'
             ADMIN_SESSION_SECRET: ci-admin-session-secret-at-least-32-chars
             PROVIDER_SESSION_SECRET: ci-provider-session-secret-at-least-32-chars
             PHONE_OTP_SECRET: ci-phone-otp-secret-at-least-32-characters
+            PROVIDER_WHATSAPP_FINGERPRINT_ACTIVE_KEY_ID: ci-primary
+            PROVIDER_WHATSAPP_FINGERPRINT_ACTIVE_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
             CALENDAR_ENCRYPTION_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
             DEV_NO_REDIS: 'false'
         steps:
@@ -185,6 +188,10 @@ jobs:
                   run_gate types 'Workspace typecheck' npm run typecheck
                   run_gate frontend-unit 'Frontend unit tests' npm run test --workspace=@reviewbot/frontend
                   run_gate backend-unit 'Backend unit and integration tests' npm run test --workspace=@reviewbot/backend
+                  run_gate release-attestation 'Release attestation tests' npm run test:release-attestation
+                  run_gate canary-resource-bindings 'Canary resource binding tests' npm run test:canary-resource-bindings
+                  run_gate pilot-readiness-policy 'Pilot readiness policy tests' npm run test:pilot-readiness-policy
+                  run_gate canary-activation 'Canary activation interlock tests' npm run test:canary-activation
                   run_gate payload-crypto 'Sealed payload cryptography tests' npm run test:sealed-payload --workspace=@reviewbot/backend
                   run_gate backend-build 'Backend production build' npm run build --workspace=@reviewbot/backend
                   run_gate frontend-build 'Frontend production build' npm run build --workspace=@reviewbot/frontend
@@ -205,6 +212,12 @@ jobs:
                   fi
                   if [[ -n "$(git status --porcelain --untracked-files=all -- backend/src/database/migrations)" ]]; then
                     echo '::error::Schema drift detected: generated migrations do not match the committed private revision.'
+                    exit 1
+                  fi
+                  if npm run db:migrate:gate --workspace=@reviewbot/backend > "$RUNNER_TEMP/db-migrate-upgrade-gate.log" 2>&1; then
+                    echo 'Fresh and 0034 upgrade migration gate passed.'
+                  else
+                    echo '::error::Fresh and 0034 upgrade migration gate failed; output is withheld from the public log.'
                     exit 1
                   fi
                   if npm run db:migrate > "$RUNNER_TEMP/db-migrate-first.log" 2>&1 && \
@@ -241,11 +254,17 @@ jobs:
 
             - name: Build both ordinary production containers
               if: steps.source.outputs.changed == 'true'
+              env:
+                  SOURCE_SHA: ${{ steps.source.outputs.sha }}
               shell: bash
               run: |
                   set -Eeuo pipefail
                   cd "${{ steps.source.outputs.directory }}"
-                  if docker build --file backend/Dockerfile --tag reviewbot-backend:release-gate . \
+                  if docker build \
+                       --file backend/Dockerfile \
+                       --build-arg "RENDER_GIT_COMMIT=$SOURCE_SHA" \
+                       --tag reviewbot-backend:release-gate \
+                       . \
                        > "$RUNNER_TEMP/backend-container.log" 2>&1 && \
                      docker build \
                        --file frontend/Dockerfile \
@@ -257,6 +276,30 @@ jobs:
                     echo 'Backend and frontend production container builds passed.'
                   else
                     echo '::error::A production container build failed; output is withheld from the public log.'
+                    exit 1
+                  fi
+                  test "$(docker image inspect reviewbot-backend:release-gate \
+                    --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                    | sed -n 's/^REVIEWBOT_BUILD_SHA=//p')" = "$SOURCE_SHA"
+                  test "$(docker image inspect reviewbot-backend:release-gate \
+                    --format '{{json .Config.Entrypoint}}')" = \
+                    '["/usr/bin/tini","--","/usr/local/bin/reviewbot-runtime-entrypoint"]'
+                  if docker run --rm \
+                       reviewbot-backend:release-gate \
+                       node -e "const fs = require('node:fs'); if (!fs.existsSync('/app/scripts/canary-activation.mjs')) process.exit(1)" \
+                       > "$RUNNER_TEMP/backend-canary-activation-payload.log" 2>&1; then
+                    echo 'Packaged backend canary activation interlock passed.'
+                  else
+                    echo '::error::The packaged backend canary activation interlock is unavailable; output is withheld from the public log.'
+                    exit 1
+                  fi
+                  if docker run --rm --entrypoint /usr/local/bin/reviewbot-pilot-readiness \
+                       reviewbot-backend:release-gate \
+                       --help \
+                       > "$RUNNER_TEMP/backend-pilot-readiness.log" 2>&1; then
+                    echo 'Packaged backend pilot readiness command passed.'
+                  else
+                    echo '::error::The packaged backend pilot readiness command failed; output is withheld from the public log.'
                     exit 1
                   fi
                   docker image rm reviewbot-backend:release-gate reviewbot-frontend:release-gate >/dev/null
@@ -310,6 +353,8 @@ jobs:
 
                   test "$(docker inspect "$image" --format '{{.Config.WorkingDir}}')" = \
                     '/home/reviewbot'
+                  test "$(docker inspect "$image" --format '{{json .Config.Entrypoint}}')" = \
+                    '["/usr/bin/tini","--","/usr/local/bin/reviewbot-sealed-entrypoint"]'
 
                   docker run --rm --entrypoint node "$image" -e "
                     const fs = require('node:fs');
@@ -328,10 +373,25 @@ jobs:
                         'backend/dist/main.js',
                         'backend/dist/database/migrate.js',
                         'backend/dist/database/migrations/meta/_journal.json',
+                        'scripts/pilot-readiness.mjs',
+                        'scripts/pilot-readiness-policy.mjs',
+                        'scripts/release-attestation.mjs',
+                        'scripts/canary-activation.mjs',
                         'node_modules',
                       ]) if (!fs.existsSync(path)) process.exit(3);
                       if (fs.existsSync('backend/src')) process.exit(4);
                     "
+
+                  if docker run --rm \
+                       --mount "type=bind,src=$key_file,dst=/etc/secrets/reviewbot_payload_key,readonly" \
+                       "$image" \
+                       /usr/local/bin/reviewbot-pilot-readiness --help \
+                       > "$RUNNER_TEMP/sealed-pilot-readiness.log" 2>&1; then
+                    echo 'Packaged sealed pilot readiness command passed.'
+                  else
+                    echo '::error::The packaged sealed pilot readiness command failed; output is withheld from the public log.'
+                    exit 1
+                  fi
 
                   test "$(docker inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
                   test "$(docker inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
@@ -642,18 +702,66 @@ jobs:
                     sleep 12
                   done
 
+                  health_ready='false'
                   for attempt in $(seq 1 30); do
                     if curl --fail --silent --show-error --max-time 15 \
                          "$RENDER_SERVICE_URL/health/live" >/dev/null && \
                        curl --fail --silent --show-error --max-time 15 \
                          "$RENDER_SERVICE_URL/health/ready" >/dev/null; then
                       echo "Render DEV public liveness and readiness passed on attempt $attempt."
-                      exit 0
+                      health_ready='true'
+                      break
                     fi
                     sleep 10
                   done
-                  echo '::error::Render DEV did not pass its public health gates.'
-                  exit 1
+                  if [[ "$health_ready" != 'true' ]]; then
+                    echo '::error::Render DEV did not pass its public health gates.'
+                    exit 1
+                  fi
+
+                  # Sample longer than the 30-second socket lease. A fresh
+                  # connection and nonce on every request make a mixed old/new
+                  # rolling deployment observable instead of cacheable.
+                  for sample in $(seq 1 10); do
+                    nonce="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sample}-$(date +%s%N)"
+                    version_response="$(curl --silent --show-error --max-time 15 \
+                      --header 'Cache-Control: no-cache' \
+                      --header 'Pragma: no-cache' \
+                      --header 'Connection: close' \
+                      --write-out $'\n%{http_code}' \
+                      "$RENDER_SERVICE_URL/health/version?_release_probe=$nonce")"
+                    version_status="${version_response##*$'\n'}"
+                    version_body="${version_response%$'\n'*}"
+                    if [[ "$version_status" != '200' ]] || \
+                       ! jq --exit-status \
+                         --arg sha "$SOURCE_SHA" \
+                         '.commit == $sha and .buildId == $sha' \
+                         <<<"$version_body" >/dev/null; then
+                      echo "::error::Render DEV release identity failed on stability sample $sample."
+                      exit 1
+                    fi
+
+                    sessions_response="$(curl --silent --show-error --max-time 15 \
+                      --header 'Cache-Control: no-cache' \
+                      --header 'Pragma: no-cache' \
+                      --header 'Connection: close' \
+                      --write-out $'\n%{http_code}' \
+                      "$RENDER_SERVICE_URL/health/sessions?_release_probe=$nonce")"
+                    sessions_status="${sessions_response##*$'\n'}"
+                    sessions_body="${sessions_response%$'\n'*}"
+                    if [[ ! "$sessions_status" =~ ^(200|503)$ ]] || \
+                       ! jq --exit-status \
+                         '.socketLease.mode == "disabled" and .socketLease.owner == false' \
+                         <<<"$sessions_body" >/dev/null; then
+                      echo "::error::Render DEV socket fence failed on stability sample $sample."
+                      exit 1
+                    fi
+
+                    if [[ "$sample" -lt 10 ]]; then
+                      sleep 4
+                    fi
+                  done
+                  echo 'Render DEV release identity and disabled socket fence passed 10 uncached samples over 36 seconds.'
 
             - name: Persist the successfully deployed private revision
               if: steps.source.outputs.changed == 'true'
